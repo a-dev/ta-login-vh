@@ -1,0 +1,2 @@
+export const ACCESS_TOKEN_TTL_SECONDS = 900;
+export const SESSION_TTL_SECONDS = 900;

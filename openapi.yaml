@@ -1,0 +1,436 @@
+openapi: 3.0.3
+
+info:
+  title: Login API
+  version: 0.1.0
+  description: |
+    Authenticates a user, issues a 15-minute JWT access token, and creates a
+    matching server-side Redis session.
+
+    The API intentionally exposes one application endpoint. `OPTIONS /login`
+    is included because it is the protocol-level CORS preflight operation used
+    by the container health check.
+
+servers:
+  - url: http://localhost:3005
+    description: Local Docker Compose environment
+
+tags:
+  - name: Authentication
+
+paths:
+  /login:
+    post:
+      operationId: login
+      summary: Log in
+      description: |
+        Authenticates an active user by normalized email and password. On
+        success, the response contains a short-lived bearer token and the API
+        stores a revocable session in Redis.
+      tags:
+        - Authentication
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            examples:
+              seededUser:
+                summary: Default seeded user
+                value:
+                  email: user@example.com
+                  password: development-only-password
+      responses:
+        "200":
+          description: Authentication succeeded and the Redis session was created.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+            Cache-Control:
+              description: Prevents clients and intermediaries from caching credentials or tokens.
+              schema:
+                type: string
+                enum:
+                  - no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginSuccess"
+              example:
+                accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example.signature
+                tokenType: Bearer
+                expiresIn: 900
+                user:
+                  id: "1"
+                  email: user@example.com
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/InvalidCredentials"
+        "403":
+          $ref: "#/components/responses/DisposableEmailNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    options:
+      operationId: preflightLogin
+      summary: Perform the CORS preflight check
+      description: Protocol-level preflight operation; it is not an additional application endpoint.
+      tags:
+        - Authentication
+      parameters:
+        - name: Origin
+          in: header
+          required: false
+          description: Browser request origin. Only the configured CORS origin is accepted.
+          schema:
+            type: string
+            format: uri
+            example: http://localhost:5173
+        - name: Access-Control-Request-Method
+          in: header
+          required: false
+          description: HTTP method requested by the browser preflight.
+          schema:
+            type: string
+            enum:
+              - POST
+        - name: Access-Control-Request-Headers
+          in: header
+          required: false
+          description: Headers requested by the browser. Content-Type and Authorization are allowed.
+          schema:
+            type: string
+            example: Content-Type, Authorization
+      responses:
+        "204":
+          description: Preflight request accepted; the response has no body.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+            Access-Control-Allow-Origin:
+              description: The configured SPA origin.
+              schema:
+                type: string
+                format: uri
+                example: http://localhost:5173
+            Access-Control-Allow-Methods:
+              description: Methods allowed by the CORS policy.
+              schema:
+                type: string
+                example: POST,OPTIONS
+            Access-Control-Allow-Headers:
+              description: Request headers allowed by the CORS policy.
+              schema:
+                type: string
+                example: Content-Type,Authorization
+            Access-Control-Expose-Headers:
+              description: |
+                Response headers a browser client is allowed to read. Sent on
+                the preflight and on every actual response.
+              schema:
+                type: string
+                example: X-Request-ID,Retry-After
+
+components:
+  parameters:
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Optional correlation ID for non-browser clients. It must start with an
+        alphanumeric character and may then contain alphanumerics, `.`, `_`, or
+        `-`, up to 128 characters. Invalid or absent values are replaced with a
+        generated UUID. The configured browser CORS policy does not allow this
+        request header.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        example: rapid-login-001
+
+  headers:
+    RequestId:
+      description: |
+        Accepted request ID or a UUID generated by the server. Listed in
+        `Access-Control-Expose-Headers`, so a browser client can read it.
+      required: true
+      schema:
+        type: string
+        example: rapid-login-001
+    RetryAfter:
+      description: |
+        Remaining whole seconds in the active rate-limit window, read from the
+        Redis TTL of the exhausted counter. The window is 600 seconds, so the
+        value never exceeds that.
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 600
+        example: 521
+
+  schemas:
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          description: |
+            Value that becomes a syntactically valid ASCII email address no
+            longer than 254 characters after surrounding whitespace is trimmed
+            and the complete value is lowercased.
+          example: user@example.com
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 128
+          description: Password is used exactly as supplied; it is not trimmed or normalized.
+          example: development-only-password
+
+    LoginSuccess:
+      type: object
+      additionalProperties: false
+      required:
+        - accessToken
+        - tokenType
+        - expiresIn
+        - user
+      properties:
+        accessToken:
+          type: string
+          description: HS256 JWT access token with a 15-minute lifetime.
+        tokenType:
+          type: string
+          enum:
+            - Bearer
+        expiresIn:
+          type: integer
+          enum:
+            - 900
+          description: Token lifetime in seconds.
+        user:
+          $ref: "#/components/schemas/User"
+
+    User:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - email
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9]+$"
+          description: MySQL BIGINT user ID serialized as a string.
+          example: "1"
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: user@example.com
+
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+
+    ValidationErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - code
+            - message
+            - details
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+            message:
+              type: string
+              enum:
+                - Invalid request
+            details:
+              type: array
+              items:
+                $ref: "#/components/schemas/ValidationIssue"
+
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - INVALID_CREDENTIALS
+            - DISPOSABLE_EMAIL_NOT_ALLOWED
+            - RATE_LIMIT_EXCEEDED
+            - SERVICE_UNAVAILABLE
+            - INTERNAL_SERVER_ERROR
+        message:
+          type: string
+
+    ValidationIssue:
+      type: object
+      additionalProperties: false
+      required:
+        - path
+        - message
+      properties:
+        path:
+          type: array
+          description: Object keys and array indices identifying the invalid value. Empty for malformed JSON.
+          items:
+            oneOf:
+              - type: string
+              - type: integer
+          example:
+            - email
+        message:
+          type: string
+          example: must be a valid ASCII email address no longer than 254 characters
+
+  responses:
+    ValidationError:
+      description: |
+        The request body could not be read or does not satisfy the schema. This
+        covers malformed JSON and schema violations, and also body-level
+        failures that never reach the schema: a body larger than the 100 KB
+        limit, a body that was not fully received, a `Content-Length` that did
+        not match the body, and an unsupported content encoding or charset.
+        Those return this status too, not `413` or `415`.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ValidationErrorEnvelope"
+          examples:
+            invalidEmail:
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Invalid request
+                  details:
+                    - path:
+                        - email
+                      message: must be a valid ASCII email address no longer than 254 characters
+            malformedJson:
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Invalid request
+                  details:
+                    - path: []
+                      message: Malformed JSON
+            bodyTooLarge:
+              summary: Body-level failure that never reaches the schema
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Invalid request
+                  details:
+                    - path: []
+                      message: Request body is too large
+
+    InvalidCredentials:
+      description: The user is unknown or inactive, or the password is incorrect.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: INVALID_CREDENTIALS
+              message: Invalid email or password
+
+    DisposableEmailNotAllowed:
+      description: The normalized email belongs to a blocked disposable-email domain.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: DISPOSABLE_EMAIL_NOT_ALLOWED
+              message: Disposable email addresses are not allowed
+
+    RateLimitExceeded:
+      description: The IP or normalized-email failure limit is already exhausted.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: RATE_LIMIT_EXCEEDED
+              message: Too many login attempts
+
+    ServiceUnavailable:
+      description: A required MySQL or Redis operation failed.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: SERVICE_UNAVAILABLE
+              message: Service temporarily unavailable
+
+    InternalServerError:
+      description: An unexpected internal operation failed.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: INTERNAL_SERVER_ERROR
+              message: Internal server error
